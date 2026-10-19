@@ -14,15 +14,14 @@ curl -fsSL https://raw.githubusercontent.com/FahadBuilds/fbc/main/install.sh | s
 
 Requires macOS and the Swift compiler, available with Xcode or the Xcode Command Line Tools.
 
+## Database access
 
-## Data freshness
+`fbc` reads Feedback Assistant’s cached database in read-only mode. It makes no network requests or API calls.
 
-Feedback Assistant does not always cache every report's platform metadata locally until the report has been opened. If `fbc` shows an `Unknown` platform followed by an FB number, open that report in Feedback Assistant while online, wait for it to load, then run `fbc` again.
-
-Opening a report usually hydrates the missing local metadata, but an unknown value can also mean that the report's form does not contain a platform answer.
+Some report details are cached only after opening the report in Feedback Assistant.
 
 ## Disclaimer
 
 `fbc` is an unofficial project and is not affiliated with Apple.
 
-It reads Feedback Assistant's local Core Data SQLite store directly. The on-disk schema is undocumented and may change without notice, which can break `fbc`.
+Feedback Assistant’s database schema is undocumented and may change without notice, which can break `fbc`.

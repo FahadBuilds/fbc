@@ -5,9 +5,11 @@ import Darwin
 private enum FBCountError: Error, CustomStringConvertible {
     case database(String)
     case missingDatabase(String)
+    case usage
 
     var description: String {
         switch self {
+        case .usage: "Usage: fbc [--missing | --help]"
         case .database(let message): message
         case .missingDatabase(let path): "Feedback database not found at \(path)"
         }
@@ -129,6 +131,100 @@ private func decodedPlatform(in data: Data) -> Platform? {
         return nil
     }
     return findPlatform(in: propertyList)
+}
+
+private func feedbackType(for answer: String) -> String? {
+    switch answer {
+    case "Suggestion", "Enhancement Request": return "Suggestion"
+    case "Incorrect/Unexpected Behavior", "Error or issue using a feature",
+         "Application Crash", "Application Slow/Unresponsive",
+         "Crash", "Crash/Hang/Data Loss", "Bug Report": return "Bug"
+    default: return nil
+    }
+}
+
+@objc(FBCCachedQuestion)
+private final class CachedQuestion: NSObject, NSCoding {
+    let text: String?
+    let answer: String?
+
+    required init?(coder: NSCoder) {
+        text = coder.decodeObject(forKey: "question_text") as? String
+        answer = coder.decodeObject(forKey: "answer_text") as? String
+    }
+
+    func encode(with coder: NSCoder) {}
+}
+
+@objc(FBCCachedQuestionGroup)
+private final class CachedQuestionGroup: NSObject, NSCoding {
+    let questions: [CachedQuestion]
+
+    required init?(coder: NSCoder) {
+        questions = coder.decodeObject(forKey: "questions") as? [CachedQuestion] ?? []
+    }
+
+    func encode(with coder: NSCoder) {}
+}
+
+private func cachedQuestions(in data: Data) -> [CachedQuestion]? {
+    guard let decoder = try? NSKeyedUnarchiver(forReadingFrom: data) else { return nil }
+    defer { decoder.finishDecoding() }
+    decoder.requiresSecureCoding = false
+    decoder.decodingFailurePolicy = .setErrorAndReturn
+    decoder.setClass(CachedQuestion.self, forClassName: "FBKQuestionAnswerPair")
+    decoder.setClass(CachedQuestionGroup.self, forClassName: "FBKQuestionGroupStub")
+    guard let groups = decoder.decodeObject(forKey: NSKeyedArchiveRootObjectKey)
+        as? [CachedQuestionGroup] else { return nil }
+    let questions = groups.flatMap(\.questions)
+    guard decoder.error == nil, !questions.isEmpty,
+          questions.allSatisfy({ $0.text != nil }) else { return nil }
+    return questions
+}
+
+private func decodedStubFeedbackType(in data: Data) -> String? {
+    guard let questions = cachedQuestions(in: data) else { return nil }
+    let types = Set(questions.compactMap { question -> String? in
+        guard let text = question.text,
+              ["What type of feedback are you reporting?", "What type of issue are you reporting?"]
+                .contains(text),
+              let answer = question.answer else { return nil }
+        return feedbackType(for: answer)
+    })
+    return types.count == 1 ? types.first : nil
+}
+
+private enum MissingFieldState: String {
+    case needsHydration
+    case unavailable = "not provided by cached form"
+    case unanswered = "no answer in cached form"
+    case unrecognized = "unrecognized cached answer"
+    case unreadable = "cached form could not be decoded"
+
+    var isUnspecified: Bool { self == .unavailable || self == .unanswered }
+}
+
+private func missingFieldState(_ field: String, stub: Data?) -> MissingFieldState {
+    guard let stub else { return .needsHydration }
+    guard let questions = cachedQuestions(in: stub) else { return .unreadable }
+    let matching = questions.filter { question in
+        guard let text = question.text else { return false }
+        if field == "type" {
+            return ["What type of feedback are you reporting?", "What type of issue are you reporting?"]
+                .contains(text)
+        }
+        return text == "Which platform is most relevant for your report?"
+    }
+    guard !matching.isEmpty else { return .unavailable }
+    return matching.contains { !($0.answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        ? .unrecognized : .unanswered
+}
+
+private func decodedFeedbackType(in data: Data) -> String? {
+    guard let answers = try? NSKeyedUnarchiver.unarchivedObject(
+        ofClasses: [NSArray.self, NSString.self], from: data
+    ) as? [String], answers.count == 1 else { return nil }
+    return feedbackType(for: answers[0])
 }
 
 private func findPlatform(in value: Any) -> Platform? {
@@ -286,6 +382,14 @@ private func countRow(_ label: String, counts: Counts, indent: Int = 2, labelWid
 }
 
 private func run() throws {
+    let arguments = Array(CommandLine.arguments.dropFirst())
+    if arguments == ["--help"] || arguments == ["-h"] {
+        print("Usage: fbc [--missing | --help]")
+        print("  --missing  List reports with missing or unreadable details.")
+        return
+    }
+    guard arguments.isEmpty || arguments == ["--missing"] else { throw FBCountError.usage }
+    let showsMissing = arguments == ["--missing"]
     let databasePath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Group Containers/group.com.apple.feedback/Library/Application Support/feedback.sqlite")
         .path
@@ -364,16 +468,75 @@ private func run() throws {
         }
 
     var platformCounts: [String: [Platform: Counts]] = [:]
+    var unspecifiedPlatforms: [String: Counts] = [:]
     var unknown: [String: [Feedback]] = [:]
     for item in feedback {
         let platform = item.stub.flatMap(decodedPlatform)
             ?? item.responseID.flatMap { answerPlatforms[$0] }
         if let platform {
             platformCounts[item.area, default: [:]][platform, default: Counts()].add(isClosed: item.isClosed)
+        } else if missingFieldState("platform", stub: item.stub).isUnspecified {
+            unspecifiedPlatforms[item.area, default: Counts()].add(isClosed: item.isClosed)
         } else {
             unknown[item.area, default: []].append(item)
         }
     }
+
+    var missingMetadata: [Int64: Set<String>] = [:]
+    var cachedMetadataIssues: [Int64: Set<String>] = [:]
+    func recordMissingField(_ field: String, remoteID: Int64, stub: Data?) {
+        guard remoteID > 0 else { return }
+        let state = missingFieldState(field, stub: stub)
+        guard !state.isUnspecified else { return }
+        if state == .needsHydration {
+            missingMetadata[remoteID, default: []].insert(field)
+        } else {
+            cachedMetadataIssues[remoteID, default: []].insert("\(field): \(state.rawValue)")
+        }
+    }
+    var feedbackTypes: [String: Counts] = [:]
+    var answerTypes: [Int64: Set<String>] = [:]
+    try database.rows("""
+        SELECT a.ZFORMRESPONSE, a.ZVALUES
+        FROM ZANSWER a
+        LEFT JOIN ZQUESTION q ON q.Z_PK = a.ZQUESTION
+        WHERE q.ZROLE = ':type_req'
+           OR q.ZTEXT IN ('What type of feedback are you reporting?', 'What type of issue are you reporting?')
+           OR a.ZQUESTION IS NULL;
+        """) { statement in
+            guard let responseID = Database.integer(statement, column: 0),
+                  let data = Database.data(statement, column: 1),
+                  let type = decodedFeedbackType(in: data) else { return }
+            answerTypes[responseID, default: []].insert(type)
+        }
+    try database.rows("""
+        SELECT c.ZCLOSED, c.ZFORMRESPONSE, s.ZQUESTIONGROUPSTUBS, c.ZSUBTITLE, c.ZREMOTEID
+        FROM ZCONTENTITEM c
+        LEFT JOIN ZFORMRESPONSESTUB s ON s.Z_PK = c.ZFORMRESPONSESTUB
+        WHERE c.ZTYPE = 4;
+        """) { statement in
+            // Dedicated report forms identify their type in the cached list subtitle.
+            let subtitle = Database.text(statement, column: 3) ?? ""
+            let formType = ["Crash Report", "Share Feedback"].first {
+                subtitle.hasSuffix(" — " + $0)
+            }.map { $0 == "Share Feedback" ? "Other" : "Bug" }
+            let type = formType
+                ?? Database.data(statement, column: 2).flatMap(decodedStubFeedbackType)
+                ?? Database.integer(statement, column: 1).flatMap { responseID in
+                    let types = answerTypes[responseID, default: []]
+                    return types.count == 1 ? types.first : nil
+                }
+                ?? "Unknown"
+            let displayedType = type == "Unknown"
+                && missingFieldState("type", stub: Database.data(statement, column: 2)).isUnspecified
+                ? "Unspecified" : type
+            feedbackTypes[displayedType, default: Counts()].add(
+                isClosed: Database.integer(statement, column: 0) == 1
+            )
+            if displayedType == "Unknown", let remoteID = Database.integer(statement, column: 4), remoteID > 0 {
+                recordMissingField("type", remoteID: remoteID, stub: Database.data(statement, column: 2))
+            }
+        }
 
     var years: [(String, Counts)] = []
     try database.rows("""
@@ -458,7 +621,8 @@ private func run() throws {
     statsLines.append(countRow("Total", counts: summaryCounts))
 
     statsLines.append("")
-    let categoryLabelWidth = max(18, categories.map { $0.name.count + 2 }.max() ?? 18)
+    let categoryLabelWidth = max(unspecifiedPlatforms.isEmpty ? 18 : 20,
+                                 categories.map { $0.name.count + 2 }.max() ?? 18)
     statsLines.append(countHeader("Top categories", labelWidth: categoryLabelWidth))
     for category in categories {
         statsLines.append(countRow(
@@ -475,8 +639,10 @@ private func run() throws {
                     : $0.value.total > $1.value.total
             })
         let unknownItems = unknown[category.name, default: []]
-        let showsUnknown = !categoryPlatforms.isEmpty && !unknownItems.isEmpty
-        let childCount = sortedPlatforms.count + (showsUnknown ? 1 : 0)
+        let unspecifiedCounts = unspecifiedPlatforms[category.name, default: Counts()]
+        let showsUnknown = !unknownItems.isEmpty
+        let showsUnspecified = (!categoryPlatforms.isEmpty || showsUnknown) && unspecifiedCounts.total > 0
+        let childCount = sortedPlatforms.count + (showsUnknown ? 1 : 0) + (showsUnspecified ? 1 : 0)
 
         for (index, entry) in sortedPlatforms.enumerated() {
             let connector = index == childCount - 1 ? "└─" : "├─"
@@ -487,13 +653,28 @@ private func run() throws {
                 labelWidth: categoryLabelWidth
             ))
         }
+        if showsUnspecified {
+            let connector = showsUnknown ? "├─" : "└─"
+            statsLines.append(countRow("\(connector) Unspecified", counts: unspecifiedCounts,
+                                       indent: 4, labelWidth: categoryLabelWidth))
+        }
         if showsUnknown {
             var unknownCounts = Counts()
             unknownItems.forEach { unknownCounts.add(isClosed: $0.isClosed) }
-            statsLines.append(countRow("└─ Unknown", counts: unknownCounts, indent: 4, labelWidth: categoryLabelWidth))
-            for item in unknownItems.sorted(by: { $0.createdAt > $1.createdAt }) {
-                statsLines.append(row("", "FB\(item.remoteID)", indent: 7, labelWidth: categoryLabelWidth))
+            statsLines.append(countRow("└─ Unknown*", counts: unknownCounts, indent: 4, labelWidth: categoryLabelWidth))
+            for item in unknownItems where item.remoteID > 0 {
+                recordMissingField("platform", remoteID: item.remoteID, stub: item.stub)
             }
+        }
+    }
+
+    statsLines.append("")
+    let typeLabelWidth = max(18, feedbackTypes.keys.map { $0.count + 4 }.max() ?? 18)
+    statsLines.append(countHeader("By type", labelWidth: typeLabelWidth))
+    for type in ["Bug", "Suggestion", "Other", "Unspecified", "Unknown"] {
+        if let counts = feedbackTypes[type], counts.total > 0 {
+            statsLines.append(countRow(type == "Unknown" ? "Unknown*" : type,
+                                       counts: counts, labelWidth: typeLabelWidth))
         }
     }
 
@@ -532,7 +713,42 @@ private func run() throws {
         end: bestVolumeStreak[1]
     ))
 
-    printDashboard(statsLines)
+    if showsMissing {
+        if missingMetadata.isEmpty && cachedMetadataIssues.isEmpty {
+            print("No missing report details.")
+            return
+        }
+        if !missingMetadata.isEmpty {
+            print(section("Reports with uncached details · \(missingMetadata.count)"))
+            print("  Open reports in Feedback Assistant while online to populate these fields.")
+            print("")
+            for remoteID in missingMetadata.keys.sorted(by: >) {
+                let fields = missingMetadata[remoteID, default: []].sorted().joined(separator: ", ")
+                print("  FB\(remoteID)  ·  \(fields)")
+            }
+        }
+        if !cachedMetadataIssues.isEmpty {
+            if !missingMetadata.isEmpty { print("") }
+            print(section("Unreadable cached details · \(cachedMetadataIssues.count)"))
+            for remoteID in cachedMetadataIssues.keys.sorted(by: >) {
+                let reasons = cachedMetadataIssues[remoteID, default: []].sorted().joined(separator: "; ")
+                print("  FB\(remoteID)  ·  \(reasons)")
+            }
+        }
+    } else {
+        printDashboard(statsLines)
+        if !missingMetadata.isEmpty || !cachedMetadataIssues.isEmpty {
+            print("")
+            if !missingMetadata.isEmpty {
+                print("* \(missingMetadata.count) reports have details that aren’t cached locally.")
+                print("  Open reports in Feedback Assistant while online to populate them.")
+            }
+            if !cachedMetadataIssues.isEmpty {
+                print("\(missingMetadata.isEmpty ? "*" : " ") \(cachedMetadataIssues.count) reports have cached details fbc couldn’t recognize.")
+            }
+            print("  Run fbc --missing to list affected reports.")
+        }
+    }
 }
 
 do {
