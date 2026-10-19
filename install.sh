@@ -43,7 +43,28 @@ if [ -z "$SOURCE_FILE" ]; then
 fi
 
 echo "Compiling fbc..."
-swiftc "$SOURCE_FILE" -o "$tmp_dir/fbc"
+compiler=$(xcrun --find swiftc)
+selected_sdk=${SDKROOT:-}
+if [ -z "$selected_sdk" ]; then
+    developer_dir=$(xcode-select -p)
+    developer_dir=${DEVELOPER_DIR:-$developer_dir}
+    case "$developer_dir" in
+        *.app) developer_dir="$developer_dir/Contents/Developer" ;;
+    esac
+    for default_sdk in \
+        "$developer_dir/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk" \
+        "$developer_dir/SDKs/MacOSX.sdk"
+    do
+        if [ -d "$default_sdk" ]; then
+            selected_sdk=$default_sdk
+            break
+        fi
+    done
+    if [ -z "$selected_sdk" ]; then
+        selected_sdk=$(xcrun --sdk macosx --show-sdk-path)
+    fi
+fi
+SDKROOT="$selected_sdk" "$compiler" -sdk "$selected_sdk" "$SOURCE_FILE" -o "$tmp_dir/fbc"
 
 install -d "$BIN_DIR"
 install "$tmp_dir/fbc" "$BIN_DIR/fbc"

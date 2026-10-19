@@ -20,6 +20,8 @@ Requires macOS and the Swift compiler, available with Xcode or the Xcode Command
 
 Some report details are cached only after opening the report in Feedback Assistant.
 
+Full Disk Access is required for your terminal app to read Feedback Assistant’s database.
+
 ## Disclaimer
 
 `fbc` is an unofficial project and is not affiliated with Apple.

@@ -5,13 +5,27 @@ import Darwin
 private enum FBCountError: Error, CustomStringConvertible {
     case database(String)
     case missingDatabase(String)
+    case accessDenied
     case usage
 
     var description: String {
         switch self {
         case .usage: "Usage: fbc [--missing | --help]"
         case .database(let message): message
-        case .missingDatabase(let path): "Feedback database not found at \(path)"
+        case .missingDatabase:
+            """
+            Feedback Assistant’s local database wasn’t found.
+            Open Feedback Assistant, sign in, and let your report list load,
+            then run fbc again.
+            """
+        case .accessDenied:
+            """
+            access to Feedback Assistant’s database was denied.
+
+            Enable Full Disk Access for your terminal app in
+            System Settings → Privacy & Security → Full Disk Access,
+            then fully quit and reopen your terminal.
+            """
         }
     }
 }
@@ -21,13 +35,17 @@ private final class Database {
 
     init(path: String) throws {
         guard FileManager.default.fileExists(atPath: path) else {
+            if access(path, F_OK) != 0, errno == EACCES || errno == EPERM {
+                throw FBCountError.accessDenied
+            }
             throw FBCountError.missingDatabase(path)
         }
         let result = sqlite3_open_v2(path, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil)
         guard result == SQLITE_OK else {
-            let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "Unable to open database"
+            let error = databaseError
             sqlite3_close(handle)
-            throw FBCountError.database(message)
+            handle = nil
+            throw error
         }
     }
 
@@ -37,7 +55,7 @@ private final class Database {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK,
               let statement else {
-            throw FBCountError.database(errorMessage)
+            throw databaseError
         }
         defer { sqlite3_finalize(statement) }
 
@@ -45,7 +63,7 @@ private final class Database {
             switch sqlite3_step(statement) {
             case SQLITE_ROW: try consume(statement)
             case SQLITE_DONE: return
-            default: throw FBCountError.database(errorMessage)
+            default: throw databaseError
             }
         }
     }
@@ -80,6 +98,17 @@ private final class Database {
 
     private var errorMessage: String {
         handle.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown SQLite error"
+    }
+
+    private var databaseError: FBCountError {
+        guard let handle else { return .database("Unable to open database") }
+        let code = sqlite3_errcode(handle) & 0xff
+        let systemError = sqlite3_system_errno(handle)
+        if code == SQLITE_AUTH || code == SQLITE_PERM
+            || systemError == EACCES || systemError == EPERM {
+            return .accessDenied
+        }
+        return .database(errorMessage)
     }
 }
 
@@ -396,6 +425,12 @@ private func run() throws {
     let database = try Database(path: databasePath)
 
     let total = try database.integer("SELECT COUNT(*) FROM ZCONTENTITEM WHERE ZTYPE = 4;")
+    guard total > 0 else {
+        print("No reports are cached locally yet.")
+        print("Open Feedback Assistant and sign in if needed, then wait for your")
+        print("report list to load and run fbc again.")
+        return
+    }
     let closed = try database.integer("SELECT COUNT(*) FROM ZCONTENTITEM WHERE ZTYPE = 4 AND ZCLOSED = 1;")
     let summaryCounts = Counts(open: total - closed, closed: closed)
 
