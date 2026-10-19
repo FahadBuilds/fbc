@@ -651,19 +651,36 @@ private func run() throws {
         LIMIT 1;
         """), expectedCount: 4)
 
+    // One label column for the entire dashboard, including indentation and a two-space gap.
+    var labelLengths = ["Summary", "Total", "Top categories", "By type", "By year",
+                        "Activity", "Today", "Best day", "Streaks", "Current",
+                        "Best duration", "Best volume"].map { 2 + $0.count }
+    labelLengths += categories.map { 2 + $0.name.count }
+    labelLengths += feedbackTypes.keys.map { 2 + ($0 == "Unknown" ? "Unknown*" : $0).count }
+    labelLengths += years.map { 2 + $0.0.count }
+    for category in categories {
+        let platforms = platformCounts[category.name, default: [:]]
+        labelLengths += platforms.keys.map { 4 + 3 + $0.rawValue.count }
+        let hasUnknown = !unknown[category.name, default: []].isEmpty
+        if hasUnknown { labelLengths.append(4 + "└─ Unknown*".count) }
+        if (!platforms.isEmpty || hasUnknown),
+           unspecifiedPlatforms[category.name, default: Counts()].total > 0 {
+            labelLengths.append(4 + "└─ Unspecified".count)
+        }
+    }
+    let labelWidth = (labelLengths.max() ?? 0) + 2
+
     var statsLines: [String] = []
-    statsLines.append(countHeader("Summary"))
-    statsLines.append(countRow("Total", counts: summaryCounts))
+    statsLines.append(countHeader("Summary", labelWidth: labelWidth))
+    statsLines.append(countRow("Total", counts: summaryCounts, labelWidth: labelWidth))
 
     statsLines.append("")
-    let categoryLabelWidth = max(unspecifiedPlatforms.isEmpty ? 18 : 20,
-                                 categories.map { $0.name.count + 2 }.max() ?? 18)
-    statsLines.append(countHeader("Top categories", labelWidth: categoryLabelWidth))
+    statsLines.append(countHeader("Top categories", labelWidth: labelWidth))
     for category in categories {
         statsLines.append(countRow(
             category.name,
             counts: Counts(open: category.open, closed: category.closed),
-            labelWidth: categoryLabelWidth
+            labelWidth: labelWidth
         ))
         let categoryPlatforms = platformCounts[category.name, default: [:]]
         let sortedPlatforms = categoryPlatforms
@@ -685,18 +702,18 @@ private func run() throws {
                 "\(connector) \(entry.key.rawValue)",
                 counts: entry.value,
                 indent: 4,
-                labelWidth: categoryLabelWidth
+                labelWidth: labelWidth
             ))
         }
         if showsUnspecified {
             let connector = showsUnknown ? "├─" : "└─"
             statsLines.append(countRow("\(connector) Unspecified", counts: unspecifiedCounts,
-                                       indent: 4, labelWidth: categoryLabelWidth))
+                                       indent: 4, labelWidth: labelWidth))
         }
         if showsUnknown {
             var unknownCounts = Counts()
             unknownItems.forEach { unknownCounts.add(isClosed: $0.isClosed) }
-            statsLines.append(countRow("└─ Unknown*", counts: unknownCounts, indent: 4, labelWidth: categoryLabelWidth))
+            statsLines.append(countRow("└─ Unknown*", counts: unknownCounts, indent: 4, labelWidth: labelWidth))
             for item in unknownItems where item.remoteID > 0 {
                 recordMissingField("platform", remoteID: item.remoteID, stub: item.stub)
             }
@@ -704,48 +721,50 @@ private func run() throws {
     }
 
     statsLines.append("")
-    let typeLabelWidth = max(18, feedbackTypes.keys.map { $0.count + 4 }.max() ?? 18)
-    statsLines.append(countHeader("By type", labelWidth: typeLabelWidth))
+    statsLines.append(countHeader("By type", labelWidth: labelWidth))
     for type in ["Bug", "Suggestion", "Other", "Unspecified", "Unknown"] {
         if let counts = feedbackTypes[type], counts.total > 0 {
             statsLines.append(countRow(type == "Unknown" ? "Unknown*" : type,
-                                       counts: counts, labelWidth: typeLabelWidth))
+                                       counts: counts, labelWidth: labelWidth))
         }
     }
 
     statsLines.append("")
-    statsLines.append(countHeader("By year"))
+    statsLines.append(countHeader("By year", labelWidth: labelWidth))
     for (year, counts) in years {
-        statsLines.append(countRow(year, counts: counts))
+        statsLines.append(countRow(year, counts: counts, labelWidth: labelWidth))
     }
 
     statsLines.append("")
-    statsLines.append(activityHeader())
-    statsLines.append(activityRow("Today", feedbackCount: "\(today)", date: todayDate))
-    statsLines.append(activityRow("Best day", feedbackCount: bestDay[1], date: bestDay[0]))
+    statsLines.append(activityHeader(labelWidth: labelWidth))
+    statsLines.append(activityRow("Today", feedbackCount: "\(today)", date: todayDate, labelWidth: labelWidth))
+    statsLines.append(activityRow("Best day", feedbackCount: bestDay[1], date: bestDay[0], labelWidth: labelWidth))
 
     statsLines.append("")
-    statsLines.append(streakHeader())
+    statsLines.append(streakHeader(labelWidth: labelWidth))
     statsLines.append(streakRow(
         "Current",
         days: currentStreak[2],
         feedbackCount: currentStreak[3],
         start: currentStreak[0],
-        end: currentStreak[1]
+        end: currentStreak[1],
+        labelWidth: labelWidth
     ))
     statsLines.append(streakRow(
         "Best duration",
         days: bestDurationStreak[2],
         feedbackCount: bestDurationStreak[3],
         start: bestDurationStreak[0],
-        end: bestDurationStreak[1]
+        end: bestDurationStreak[1],
+        labelWidth: labelWidth
     ))
     statsLines.append(streakRow(
         "Best volume",
         days: bestVolumeStreak[2],
         feedbackCount: bestVolumeStreak[3],
         start: bestVolumeStreak[0],
-        end: bestVolumeStreak[1]
+        end: bestVolumeStreak[1],
+        labelWidth: labelWidth
     ))
 
     if showsMissing {
