@@ -601,10 +601,12 @@ private func run() throws {
     let todayDate = try database.text("SELECT date('now', 'localtime');")
     let currentStreak = try split(database.text("""
         WITH RECURSIVE streak(day) AS (
-          SELECT date('now', 'localtime') WHERE EXISTS (
-            SELECT 1 FROM ZCONTENTITEM WHERE ZTYPE = 4
-              AND date(ZCREATEDAT + 978307200, 'unixepoch', 'localtime') = date('now', 'localtime')
-          )
+          SELECT MAX(date(ZCREATEDAT + 978307200, 'unixepoch', 'localtime'))
+          FROM ZCONTENTITEM
+          WHERE ZTYPE = 4
+            AND date(ZCREATEDAT + 978307200, 'unixepoch', 'localtime')
+                IN (date('now', 'localtime'), date('now', 'localtime', '-1 day'))
+          HAVING COUNT(*) > 0
           UNION ALL
           SELECT date(day, '-1 day') FROM streak WHERE EXISTS (
             SELECT 1 FROM ZCONTENTITEM WHERE ZTYPE = 4
