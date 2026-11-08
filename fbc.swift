@@ -7,10 +7,12 @@ private enum FBCountError: Error, CustomStringConvertible {
     case missingDatabase(String)
     case accessDenied
     case usage
+    case reportNotFound(Int64)
 
     var description: String {
         switch self {
-        case .usage: "Usage: fbc [--missing | --help]"
+        case .usage: "Usage: fbc [--missing | --help]\nfbc list [--closed | --open] [--json]\nfbc show FB<number> [--json]"
+        case .reportNotFound(let id): "FB\(id) wasn’t found in Feedback Assistant’s local database."
         case .database(let message): message
         case .missingDatabase:
             """
@@ -410,19 +412,187 @@ private func countRow(_ label: String, counts: Counts, indent: Int = 2, labelWid
         + leftAligned(String(format: "%.1f%%", counts.closedPercent), width: 11)
 }
 
+private func jsonDate(_ statement: OpaquePointer, column: Int32) -> Any {
+    guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return NSNull() }
+    return ISO8601DateFormatter().string(from: Date(
+        timeIntervalSinceReferenceDate: sqlite3_column_double(statement, column)
+    ))
+}
+
+private func statusValues(_ data: Data?) -> [String: String] {
+    guard let data,
+          let values = try? NSKeyedUnarchiver.unarchivedObject(
+            ofClasses: [NSDictionary.self, NSString.self], from: data
+          ) as? [String: String] else { return [:] }
+    return values
+}
+
+private func printJSON(_ value: Any) throws {
+    let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+}
+
+private func reportSummaries(_ database: Database, filter: String) throws -> [[String: Any]] {
+    var reports: [[String: Any]] = []
+    try database.rows("""
+        SELECT c.ZREMOTEID, c.ZTITLE, c.ZCLOSED, c.ZAREA, c.ZCREATEDAT, s.ZSTATUSPAIRS
+        FROM ZCONTENTITEM c
+        LEFT JOIN ZFEEDBACK f ON f.Z_PK = c.ZFEEDBACK
+        LEFT JOIN ZFEEDBACKSTATUS s ON s.Z_PK = f.ZSTATUS
+        WHERE c.ZTYPE = 4 AND c.ZREMOTEID > 0 \(filter)
+        ORDER BY c.ZCREATEDAT DESC, c.ZREMOTEID DESC;
+        """) { statement in
+            let statuses = statusValues(Database.data(statement, column: 5))
+            reports.append([
+                "id": "FB\(sqlite3_column_int64(statement, 0))",
+                "title": Database.text(statement, column: 1) as Any? ?? NSNull(),
+                "closed": Database.integer(statement, column: 2) == 1,
+                "area": Database.text(statement, column: 3) as Any? ?? NSNull(),
+                "createdAt": jsonDate(statement, column: 4),
+                "resolution": statuses["Resolution"] as Any? ?? NSNull(),
+                "recentSimilarReports": statuses["Recent Similar Reports"] as Any? ?? NSNull()
+            ])
+        }
+    return reports
+}
+
+private func showReport(_ id: Int64, database: Database, json: Bool) throws {
+    guard var report = try reportSummaries(database, filter: "AND c.ZREMOTEID = \(id)").first
+    else { throw FBCountError.reportNotFound(id) }
+    var fields: [[String: Any]] = []
+    var hasCachedForm = false
+    var hasCachedFeedback = false
+    try database.rows("""
+        SELECT c.ZFORMRESPONSE, c.ZFEEDBACK, s.ZQUESTIONGROUPSTUBS
+        FROM ZCONTENTITEM c
+        LEFT JOIN ZFORMRESPONSESTUB s ON s.Z_PK = c.ZFORMRESPONSESTUB
+        WHERE c.ZTYPE = 4 AND c.ZREMOTEID = \(id);
+        """) { statement in
+            hasCachedFeedback = Database.integer(statement, column: 1) != nil
+            if let data = Database.data(statement, column: 2), let questions = cachedQuestions(in: data) {
+                hasCachedForm = true
+                fields = questions.map { ["question": $0.text as Any? ?? NSNull(),
+                                          "answer": $0.answer as Any? ?? NSNull()] }
+            }
+            if fields.isEmpty, let responseID = Database.integer(statement, column: 0) {
+                try database.rows("""
+                    SELECT q.ZTEXT, a.ZVALUES FROM ZANSWER a
+                    LEFT JOIN ZQUESTION q ON q.Z_PK = a.ZQUESTION
+                    WHERE a.ZFORMRESPONSE = \(responseID)
+                    ORDER BY q.ZSORTORDER, a.Z_PK;
+                    """) { answer in
+                        guard let data = Database.data(answer, column: 1),
+                              let values = try? NSKeyedUnarchiver.unarchivedObject(
+                                ofClasses: [NSArray.self, NSString.self], from: data
+                              ) as? [String] else { return }
+                        fields.append(["question": Database.text(answer, column: 0) as Any? ?? NSNull(),
+                                       "answer": values.joined(separator: ", ")])
+                    }
+                hasCachedForm = !fields.isEmpty
+            }
+        }
+    var messages: [[String: Any]] = []
+    try database.rows("""
+        SELECT 'followup', u.ZREMOTEID, u.ZCREATEDAT, u.ZDISPLAYTEXT, u.ZTYPE, NULL
+        FROM ZFEEDBACKFOLLOWUP u
+        JOIN ZFEEDBACK f ON f.Z_PK = u.ZFEEDBACK
+        JOIN ZCONTENTITEM c ON c.ZFEEDBACK = f.Z_PK
+        WHERE c.ZTYPE = 4 AND c.ZREMOTEID = \(id) AND trim(COALESCE(u.ZDISPLAYTEXT, '')) != ''
+        UNION ALL
+        SELECT 'response', r.ZREMOTEID, r.ZCREATEDAT, r.ZTEXT, r.ZTYPE, r.ZROLE
+        FROM ZFEEDBACKFOLLOWUPRESPONSE r
+        JOIN ZFEEDBACKFOLLOWUP u ON u.Z_PK = r.ZFOLLOWUP
+        JOIN ZFEEDBACK f ON f.Z_PK = u.ZFEEDBACK
+        JOIN ZCONTENTITEM c ON c.ZFEEDBACK = f.Z_PK
+        WHERE c.ZTYPE = 4 AND c.ZREMOTEID = \(id) AND trim(COALESCE(r.ZTEXT, '')) != ''
+        ORDER BY 3, 2;
+        """) { statement in
+            let isFollowup = Database.text(statement, column: 0) == "followup"
+            let rawType = Database.integer(statement, column: 4)
+            let role = Database.text(statement, column: 5)
+            let isApple = isFollowup && (rawType == 3 || rawType == 6)
+            let isComment = !isFollowup && role == ":comments"
+            messages.append([
+                "id": Database.integer(statement, column: 1).map { String($0) } as Any? ?? NSNull(),
+                "kind": isApple ? "appleReply" : isComment ? "userReply" : isFollowup ? "followup" : "attachment",
+                "author": (isApple ? "Apple" : isComment ? "You" : nil) as Any? ?? NSNull(),
+                "createdAt": jsonDate(statement, column: 2),
+                "text": Database.text(statement, column: 3) ?? ""
+            ])
+        }
+    report["fields"] = fields
+    report["messages"] = messages
+    report["cache"] = ["form": hasCachedForm ? "available" : "unavailable",
+                       "conversation": hasCachedFeedback ? "availableMayBeIncomplete" : "unavailable"]
+    if json {
+        try printJSON(report)
+        return
+    }
+    print("\(report["id"]!) — \(report["title"] as? String ?? "Untitled")")
+    print("Status: \(report["closed"] as? Bool == true ? "Closed" : "Open")")
+    print("Resolution: \(report["resolution"] as? String ?? "Not cached")")
+    print("Recent Similar Reports: \(report["recentSimilarReports"] as? String ?? "Not cached")")
+    print("\nReport details")
+    if fields.isEmpty { print("  No readable form answers cached. Open this report in Feedback Assistant to load details.") }
+    for field in fields {
+        print("\n\(field["question"] as? String ?? "Question unavailable")")
+        print(field["answer"] as? String ?? "Unspecified")
+    }
+    print("\nCached conversation")
+    if messages.isEmpty { print("  No messages cached locally; this does not confirm there are no replies.") }
+    for message in messages {
+        let author = message["author"] as? String ?? (message["kind"] as? String ?? "Unknown")
+        print("\n\(author) · \(message["createdAt"] as? String ?? "Date unavailable")")
+        print(message["text"] as? String ?? "")
+    }
+    print("\nCached details may be incomplete. fbc does not fetch updates.")
+}
+
 private func run() throws {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--help"] || arguments == ["-h"] {
-        print("Usage: fbc [--missing | --help]")
+        print(FBCountError.usage.description)
         print("  --missing  List reports with missing or unreadable details.")
         return
     }
-    guard arguments.isEmpty || arguments == ["--missing"] else { throw FBCountError.usage }
+    let command = arguments.first
+    let json = arguments.contains("--json")
+    var reportID: Int64?
+    if command == "list" {
+        let flags = Array(arguments.dropFirst())
+        guard Set(flags).count == flags.count,
+              flags.allSatisfy({ ["--closed", "--open", "--json"].contains($0) }),
+              !(flags.contains("--closed") && flags.contains("--open")) else { throw FBCountError.usage }
+    } else if command == "show" {
+        let values = arguments.dropFirst().filter { $0 != "--json" }
+        guard values.count == 1, arguments.filter({ $0 == "--json" }).count <= 1 else { throw FBCountError.usage }
+        let value = values[0].uppercased()
+        let digits = value.hasPrefix("FB") ? String(value.dropFirst(2)) : value
+        guard !digits.isEmpty, digits.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+              let id = Int64(digits), id > 0 else { throw FBCountError.usage }
+        reportID = id
+    } else {
+        guard arguments.isEmpty || arguments == ["--missing"] else { throw FBCountError.usage }
+    }
     let showsMissing = arguments == ["--missing"]
     let databasePath = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Group Containers/group.com.apple.feedback/Library/Application Support/feedback.sqlite")
         .path
     let database = try Database(path: databasePath)
+
+    if command == "list" {
+        let filter = arguments.contains("--closed") ? "AND c.ZCLOSED = 1"
+            : arguments.contains("--open") ? "AND COALESCE(c.ZCLOSED, 0) != 1" : ""
+        let reports = try reportSummaries(database, filter: filter)
+        if json { try printJSON(reports) }
+        else { reports.forEach { print($0["id"] as! String) } }
+        return
+    }
+    if let reportID {
+        try showReport(reportID, database: database, json: json)
+        return
+    }
 
     let total = try database.integer("SELECT COUNT(*) FROM ZCONTENTITEM WHERE ZTYPE = 4;")
     guard total > 0 else {
