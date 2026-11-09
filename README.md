@@ -12,7 +12,7 @@ Run this in Terminal:
 curl -fsSL https://raw.githubusercontent.com/FahadBuilds/fbc/main/install.sh | sh
 ```
 
-Requires macOS and the Swift compiler, available with Xcode or the Xcode Command Line Tools.
+Requires macOS and Command Line Tools. If the tools aren’t installed, macOS will prompt you to install them.
 
 ## Commands
 
@@ -35,7 +35,7 @@ fbc show FB24490370
 
 Use `fbc --help` or `fbc <command> --help` for options. `list` outputs IDs by default; add `--titles` for titles or `--json` for structured output.
 
-Report details and replies come from Feedback Assistant’s local cache and may be incomplete.
+Totals, categories, and streaks work without opening individual reports. For missing type or platform details, `fbc` identifies which reports to open in Feedback Assistant. Opening a report also makes its cached text and replies available to `fbc`.
 
 ## Database access
 
