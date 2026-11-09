@@ -19,20 +19,11 @@ Full Disk Access is required for your terminal app to read Feedback Assistant’
 ## Commands
 
 ```bash
-# Dashboard
-fbc
-
-# All category counts
-fbc categories
-
-# Reports in a category, with titles
-fbc list --category "SwiftUI" --titles
-
-# Closed reports as JSON
-fbc list --closed --json
-
-# Report details and cached replies
-fbc show FB24490370
+fbc                                   # Dashboard
+fbc categories                        # All category counts
+fbc list --category "SwiftUI" --titles  # Reports in a category, with titles
+fbc list --closed --json               # Closed reports as JSON
+fbc show FB24490370                    # Report details and cached replies
 ```
 
 Use `fbc --help` or `fbc <command> --help` for options. `list` outputs IDs by default; add `--titles` for titles or `--json` for structured output.
