@@ -11,7 +11,7 @@ private enum FBCountError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .usage: "Usage: fbc [--missing | --help]\nfbc list [--closed | --open] [--json]\nfbc show FB<number> [--json]"
+        case .usage: "Usage: fbc [--missing | --help]\nfbc categories [--json]\nfbc list [--closed | --open] [--category <name>] [--titles | --json]\nfbc show FB<number> [--json]"
         case .reportNotFound(let id): "FB\(id) wasn’t found in Feedback Assistant’s local database."
         case .database(let message): message
         case .missingDatabase:
@@ -53,13 +53,20 @@ private final class Database {
 
     deinit { sqlite3_close(handle) }
 
-    func rows(_ sql: String, consume: (OpaquePointer) throws -> Void) throws {
+    func rows(_ sql: String, parameters: [String] = [], consume: (OpaquePointer) throws -> Void) throws {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK,
               let statement else {
             throw databaseError
         }
         defer { sqlite3_finalize(statement) }
+        for (index, value) in parameters.enumerated() {
+            let result = value.withCString {
+                sqlite3_bind_text(statement, Int32(index + 1), $0, -1,
+                                  unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            }
+            guard result == SQLITE_OK else { throw databaseError }
+        }
 
         while true {
             switch sqlite3_step(statement) {
@@ -433,7 +440,7 @@ private func printJSON(_ value: Any) throws {
     FileHandle.standardOutput.write(Data("\n".utf8))
 }
 
-private func reportSummaries(_ database: Database, filter: String) throws -> [[String: Any]] {
+private func reportSummaries(_ database: Database, filter: String, category: String? = nil) throws -> [[String: Any]] {
     var reports: [[String: Any]] = []
     try database.rows("""
         SELECT c.ZREMOTEID, c.ZTITLE, c.ZCLOSED, c.ZAREA, c.ZCREATEDAT, s.ZSTATUSPAIRS
@@ -441,8 +448,9 @@ private func reportSummaries(_ database: Database, filter: String) throws -> [[S
         LEFT JOIN ZFEEDBACK f ON f.Z_PK = c.ZFEEDBACK
         LEFT JOIN ZFEEDBACKSTATUS s ON s.Z_PK = f.ZSTATUS
         WHERE c.ZTYPE = 4 AND c.ZREMOTEID > 0 \(filter)
+          \(category == nil ? "" : "AND c.ZAREA = ? COLLATE NOCASE")
         ORDER BY c.ZCREATEDAT DESC, c.ZREMOTEID DESC;
-        """) { statement in
+        """, parameters: category.map { [$0] } ?? []) { statement in
             let statuses = statusValues(Database.data(statement, column: 5))
             reports.append([
                 "id": "FB\(sqlite3_column_int64(statement, 0))",
@@ -549,22 +557,98 @@ private func showReport(_ id: Int64, database: Database, json: Bool) throws {
     print("\nCached details may be incomplete. fbc does not fetch updates.")
 }
 
+private func printHelp(for command: String? = nil) {
+    switch command {
+    case "categories":
+        print("Usage: fbc categories [--json]")
+        print("List all named categories and report counts, highest count first.")
+    case "list":
+        print("Usage: fbc list [--closed | --open] [--category <name>] [--titles | --json]")
+        print("List report IDs, newest first. Filters can be combined.")
+        print("  --category <name>  Match a full category name, ignoring case.")
+        print("  --titles           Include each report’s title after its ID.")
+        print("  --closed / --open  Filter by closed status.")
+        print("  --json             Output report summaries as JSON.")
+        print("\nExample: fbc list --category \"SwiftUI\" --open --titles")
+    case "show":
+        print("Usage: fbc show FB<number> [--json]")
+        print("Show report details and the cached conversation. The FB prefix is optional.")
+    default:
+        print(FBCountError.usage.description)
+        print("\nRun fbc without arguments for the dashboard.")
+        print("  categories  List all named categories and report counts.")
+        print("  list        List report IDs, optionally filtered or with titles.")
+        print("  show        Show report details and cached replies.")
+        print("  --missing   List reports with missing or unreadable details.")
+        print("  -h, --help  Show help. Commands also accept --help.")
+    }
+}
+
+private func printCategories(_ database: Database, json: Bool) throws {
+    var categories: [[String: Any]] = []
+    try database.rows("""
+        SELECT ZAREA, COUNT(*) AS total
+        FROM ZCONTENTITEM
+        WHERE ZTYPE = 4 AND ZREMOTEID > 0 AND ZAREA IS NOT NULL AND trim(ZAREA) != ''
+        GROUP BY ZAREA ORDER BY total DESC, ZAREA COLLATE NOCASE, ZAREA;
+        """) { statement in
+            categories.append(["category": Database.text(statement, column: 0) ?? "",
+                               "count": Int(sqlite3_column_int64(statement, 1))])
+        }
+    if json { try printJSON(categories); return }
+    let width = max("Category".count, categories.compactMap { ($0["category"] as? String)?.count }.max() ?? 0) + 2
+    print(leftAligned("Category", width: width) + "Count")
+    for category in categories {
+        let name = category["category"] as? String ?? ""
+        print(leftAligned(name, width: width) + "\(category["count"]!)")
+    }
+}
+
 private func run() throws {
     let arguments = Array(CommandLine.arguments.dropFirst())
     if arguments == ["--help"] || arguments == ["-h"] {
-        print(FBCountError.usage.description)
-        print("  --missing  List reports with missing or unreadable details.")
+        printHelp()
         return
     }
     let command = arguments.first
-    let json = arguments.contains("--json")
+    if arguments.count == 2, ["list", "show", "categories"].contains(command ?? ""),
+       ["--help", "-h"].contains(arguments[1]) {
+        printHelp(for: command)
+        return
+    }
+    var json = false
+    var titles = false
+    var category: String?
+    var closedOnly = false
+    var openOnly = false
     var reportID: Int64?
     if command == "list" {
-        let flags = Array(arguments.dropFirst())
-        guard Set(flags).count == flags.count,
-              flags.allSatisfy({ ["--closed", "--open", "--json"].contains($0) }),
-              !(flags.contains("--closed") && flags.contains("--open")) else { throw FBCountError.usage }
+        var index = 1
+        var seen: Set<String> = []
+        while index < arguments.count {
+            let flag = arguments[index]
+            guard seen.insert(flag).inserted else { throw FBCountError.usage }
+            switch flag {
+            case "--closed": closedOnly = true
+            case "--open": openOnly = true
+            case "--json": json = true
+            case "--titles": titles = true
+            case "--category":
+                index += 1
+                guard index < arguments.count, !arguments[index].hasPrefix("--"),
+                      !arguments[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else { throw FBCountError.usage }
+                category = arguments[index]
+            default: throw FBCountError.usage
+            }
+            index += 1
+        }
+        guard !(closedOnly && openOnly), !(json && titles) else { throw FBCountError.usage }
+    } else if command == "categories" {
+        guard arguments.count == 1 || arguments == ["categories", "--json"] else { throw FBCountError.usage }
+        json = arguments.contains("--json")
     } else if command == "show" {
+        json = arguments.contains("--json")
         let values = arguments.dropFirst().filter { $0 != "--json" }
         guard values.count == 1, arguments.filter({ $0 == "--json" }).count <= 1 else { throw FBCountError.usage }
         let value = values[0].uppercased()
@@ -581,12 +665,30 @@ private func run() throws {
         .path
     let database = try Database(path: databasePath)
 
+    if command == "categories" {
+        try printCategories(database, json: json)
+        return
+    }
     if command == "list" {
-        let filter = arguments.contains("--closed") ? "AND c.ZCLOSED = 1"
-            : arguments.contains("--open") ? "AND COALESCE(c.ZCLOSED, 0) != 1" : ""
-        let reports = try reportSummaries(database, filter: filter)
+        let filter = closedOnly ? "AND c.ZCLOSED = 1"
+            : openOnly ? "AND COALESCE(c.ZCLOSED, 0) != 1" : ""
+        let reports = try reportSummaries(database, filter: filter, category: category)
         if json { try printJSON(reports) }
-        else { reports.forEach { print($0["id"] as! String) } }
+        else {
+            let terminal = isatty(STDOUT_FILENO) != 0
+            let idWidth = reports.compactMap { ($0["id"] as? String)?.count }.max() ?? 0
+            for report in reports {
+                let id = report["id"] as! String
+                let title = (report["title"] as? String ?? "Untitled")
+                    .components(separatedBy: .newlines).joined(separator: " ")
+                if titles {
+                    let prefix = terminal ? leftAligned(id, width: idWidth + 2) : id + "\t"
+                    print(prefix + title)
+                } else {
+                    print(id)
+                }
+            }
+        }
         return
     }
     if let reportID {
