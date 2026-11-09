@@ -14,6 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/FahadBuilds/fbc/main/install.sh | s
 
 Requires macOS and Command Line Tools. If the tools aren’t installed, macOS will prompt you to install them.
 
+Full Disk Access is required for your terminal app to read Feedback Assistant’s database. If access is denied, `fbc` shows instructions for enabling it.
+
 ## Commands
 
 ```bash
@@ -35,15 +37,11 @@ fbc show FB24490370
 
 Use `fbc --help` or `fbc <command> --help` for options. `list` outputs IDs by default; add `--titles` for titles or `--json` for structured output.
 
-Totals, categories, and streaks work without opening individual reports. For missing type or platform details, `fbc` identifies which reports to open in Feedback Assistant. Opening a report also makes its cached text and replies available to `fbc`.
-
 ## Database access
 
 `fbc` reads Feedback Assistant’s cached database in read-only mode. It makes no network requests or API calls.
 
-Some report details are cached only after opening the report in Feedback Assistant.
-
-Full Disk Access is required for your terminal app to read Feedback Assistant’s database.
+Totals, categories, and streaks work without opening individual reports. For missing type or platform details, `fbc` identifies which reports to open in Feedback Assistant. Opening a report also makes its cached text and replies available to `fbc`.
 
 ## Disclaimer
 
